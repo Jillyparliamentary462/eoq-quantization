@@ -1,0 +1,660 @@
+From: dct-quantization project
+Subject: [PATCH 03] Add EOQ (rANS) transparent decompression to GGUF model loader
+Date: 2026-03-28
+
+Modify the GGUF model loading pipeline so that tensors stored with
+GGML_TYPE_EOQ are transparently decoded at load time.  After loading
+completes, every tensor has been converted back to its original
+quantization type (Q4_K, Q5_K, Q2_K, etc.) and the EOQ wrapper is
+fully dissolved -- no runtime code path ever sees GGML_TYPE_EOQ.
+
+Design overview
+---------------
+
+EOQ is a TRANSPORT-ONLY compression layer.  On disk, a GGUF file may
+store tensor data as rANS-compressed byte streams tagged with type
+GGML_TYPE_EOQ.  The per-tensor metadata required for decompression is
+stored as GGUF key-value pairs using the namespace "eoq.tensor.<name>.*".
+
+The loader intercepts EOQ tensors at two points:
+
+  1. create_tensor() -- When the loader reads tensor metadata from the
+     GGUF header, it detects GGML_TYPE_EOQ tensors and looks up the
+     original type from "eoq.tensor.<name>.original_type".  It then
+     creates the in-memory tensor with the ORIGINAL type and dimensions
+     so that buffer allocation, graph construction, and every downstream
+     consumer sees only standard GGML types.  The compressed on-disk
+     size (smaller) differs from the in-memory size (full), and the
+     loader tracks this mapping.
+
+  2. load_all_data() -- When the loader copies tensor data from the
+     file into memory, it detects that an EOQ tensor's on-disk size
+     differs from the in-memory size.  It reads the compressed payload
+     into a temporary buffer, reconstructs the eoq_tensor_header_t
+     from GGUF KV metadata, calls eoq_decode_tensor() to decompress,
+     and writes the decompressed data into the tensor's final buffer.
+
+GGUF key-value namespace for EOQ metadata
+------------------------------------------
+
+For each tensor named "<T>" that is stored as GGML_TYPE_EOQ, the
+converter writes these keys:
+
+  eoq.tensor.<T>.original_type     (uint32)  Original GGML type enum value
+  eoq.tensor.<T>.num_blocks        (uint32)  Number of quant blocks
+  eoq.tensor.<T>.freq_table_size   (uint32)  rANS alphabet size
+  eoq.tensor.<T>.precision_bits    (uint32)  rANS precision (typically 16)
+  eoq.tensor.<T>.rans_block_size   (uint32)  Symbols per rANS block
+  eoq.tensor.<T>.compressed_size   (uint32)  Compressed payload bytes
+  eoq.tensor.<T>.uncompressed_size (uint32)  Uncompressed payload bytes
+
+Dots in tensor names (e.g. "blk.0.attn_q.weight") are preserved as-is
+in the key, because GGUF keys are arbitrary UTF-8 strings and the
+"eoq.tensor." prefix is unambiguous.
+
+The compressed tensor data region in the GGUF data blob has the layout
+produced by eoq_encode_tensor():
+
+  [freq_table: uint16_t * alphabet_size]
+  [block_offsets: uint32_t * num_rans_blocks]
+  [rANS compressed stream bytes]
+
+This is read as an opaque byte blob by the loader, and passed directly
+to eoq_decode_tensor() which knows the internal structure.
+
+Integration with patches 01, 02, and 04
+-----------------------------------------
+
+  - Patch 01 (ggml.h): Defines GGML_TYPE_EOQ = 43 and GGML_FTYPE_MOSTLY_EOQ.
+  - Patch 02 (ggml.c): Registers type_traits[GGML_TYPE_EOQ] with
+    blck_size=1, type_size=1, is_quantized=false.
+  - Patch 04 (CMakeLists.txt): Compiles eoq_rans_v2.c and links the
+    EOQ code into the ggml library under the GGML_EOQ build option.
+  - This patch (03): Hooks the loader to call eoq_decode_tensor() when
+    it encounters GGML_TYPE_EOQ.
+
+Files modified:
+
+  src/llama-model-loader.cpp  -- Main changes (EOQ detection + decode)
+  src/llama-model-loader.h    -- Add EOQ metadata cache to loader struct
+
+---
+ src/llama-model-loader.cpp | ~180 lines added
+ src/llama-model-loader.h   |  ~20 lines added
+ 2 files changed
+
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index 0000000..1111111 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -1,6 +1,10 @@
+ #pragma once
+
+ #include "llama.h"
++
++#ifdef GGML_EOQ
++#include "eoq_ggml.h"   // EOQ rANS decompression API
++#endif
+
+ #include "llama-impl.h"
+ #include "llama-arch.h"
+@@ -XXX,6 +XXX,28 @@ struct llama_model_loader {
+     // track tensors that had to be moved for debugging:
+     size_t n_tensors_moved = 0;
+
++#ifdef GGML_EOQ
++    // ----------------------------------------------------------------
++    // EOQ transport decompression support
++    //
++    // When a tensor is stored as GGML_TYPE_EOQ on disk, its in-memory
++    // type is the original quant type (Q4_K, etc.).  We need to track
++    // the compressed (on-disk) size separately from the in-memory size
++    // so that load_all_data() reads the correct number of bytes and
++    // then decompresses.
++    // ----------------------------------------------------------------
++    struct eoq_tensor_info {
++        eoq_tensor_header_t header;   // full EOQ metadata for decode
++        size_t              on_disk_size;  // compressed size in GGUF file
++    };
++
++    // Map from tensor name -> EOQ decode info.
++    // Only populated for tensors that were GGML_TYPE_EOQ in the file.
++    std::unordered_map<std::string, eoq_tensor_info> eoq_tensors;
++
++    size_t n_eoq_decoded = 0;   // counter for progress reporting
++#endif
++
+     std::string first_tensor_moved_name;
+     std::string first_tensor_moved_type_name;
+
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 0000000..1111111 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1,5 +1,9 @@
+ #include "llama-model-loader.h"
+
++#ifdef GGML_EOQ
++#include "eoq_ggml.h"   // eoq_decode_tensor, eoq_tensor_header_t
++#endif
++
+ #include "ggml-alloc.h"
+ #include "ggml.h"
+ #include "gguf.h"
+@@ -XXX,6 +XXX,65 @@
++// =====================================================================
++// EOQ helper: read per-tensor metadata from GGUF key-value pairs
++// =====================================================================
++//
++// This function is called for each tensor whose on-disk type is
++// GGML_TYPE_EOQ.  It reads the EOQ metadata stored by the converter
++// tool and populates an eoq_tensor_header_t.
++//
++// Returns the original GGML type, or GGML_TYPE_COUNT on error.
++//
++#ifdef GGML_EOQ
++static enum ggml_type eoq_read_tensor_metadata(
++        const struct gguf_context * gguf_ctx,
++        const char * tensor_name,
++        eoq_tensor_header_t * header)
++{
++    char key[512];
++
++    // Helper macro: look up a uint32 GGUF key, abort if missing.
++    #define EOQ_READ_U32(field, suffix) do {                               \
++        snprintf(key, sizeof(key), "eoq.tensor.%s." suffix, tensor_name); \
++        int64_t kid = gguf_find_key(gguf_ctx, key);                        \
++        if (kid < 0) {                                                     \
++            LLAMA_LOG_ERROR("%s: missing EOQ metadata key '%s'\n",         \
++                           __func__, key);                                 \
++            return GGML_TYPE_COUNT;                                        \
++        }                                                                  \
++        header->field = gguf_get_val_u32(gguf_ctx, kid);                   \
++    } while (0)
++
++    EOQ_READ_U32(original_type,      "original_type");
++    EOQ_READ_U32(num_blocks,         "num_blocks");
++    EOQ_READ_U32(freq_table_size,    "freq_table_size");
++    EOQ_READ_U32(precision_bits,     "precision_bits");
++    EOQ_READ_U32(rans_block_size,    "rans_block_size");
++    EOQ_READ_U32(compressed_size,    "compressed_size");
++    EOQ_READ_U32(uncompressed_size,  "uncompressed_size");
++
++    #undef EOQ_READ_U32
++
++    // Validate: original_type must be a real quantization type.
++    if (header->original_type >= GGML_TYPE_COUNT ||
++        header->original_type == GGML_TYPE_EOQ) {
++        LLAMA_LOG_ERROR("%s: tensor '%s' has invalid original_type %u\n",
++                       __func__, tensor_name, header->original_type);
++        return GGML_TYPE_COUNT;
++    }
++
++    LLAMA_LOG_DEBUG("%s: EOQ tensor '%s': original_type=%s (%u), "
++                   "compressed=%u -> uncompressed=%u bytes, "
++                   "precision=%u bits, alphabet=%u\n",
++                   __func__, tensor_name,
++                   ggml_type_name((enum ggml_type)header->original_type),
++                   header->original_type,
++                   header->compressed_size,
++                   header->uncompressed_size,
++                   header->precision_bits,
++                   header->freq_table_size);
++
++    return (enum ggml_type)header->original_type;
++}
++#endif // GGML_EOQ
++
+
+ // =====================================================================
+ // Modification to llama_model_loader constructor
+@@ -XXX,6 +XXX,10 @@
+ //
+ // In the constructor body, inside the loop that populates weights_map
+ // from the GGUF tensor info, we add EOQ detection.  The relevant loop
+ // iterates over n_tensors and creates ggml_tensor objects.  When we
+ // encounter a tensor with type GGML_TYPE_EOQ, we:
+ //
+ //   1. Read its EOQ metadata from GGUF KV pairs.
+ //   2. Change the tensor's type to the original quant type.
+ //   3. Recalculate ne[]/nb[] for the new type so that the tensor
+ //      has the correct in-memory layout.
+ //   4. Store the compressed on-disk size in eoq_tensors so that
+ //      load_all_data() knows how many bytes to read.
+ //
+ // Pseudo-location: inside the constructor, in the ggml_context loop
+ // that calls gguf_get_tensor_type() to initialize tensors from the
+ // GGUF header.  The exact context differs between the files-based
+ // path and the external-metadata path.
+ //
+ // In the files-based path (around line ~600-690 of the constructor),
+ // after the tensor is initialized from GGUF info:
+ //
+ // ------------------------------------------------------------------
+
+ // === BEGIN INSERTED CODE (in constructor, after tensor type is set) ===
+ //
+ // This block runs once for each tensor read from the GGUF file header.
+ // Variable 'tensor' is the ggml_tensor* just created, and
+ // 'metadata' is the gguf_context* for the file.
+
++#ifdef GGML_EOQ
++    if (tensor->type == GGML_TYPE_EOQ) {
++        const char * tname = ggml_get_name(tensor);
++
++        // Read all EOQ metadata from GGUF KV store.
++        eoq_tensor_info info;
++        memset(&info.header, 0, sizeof(info.header));
++
++        enum ggml_type orig_type = eoq_read_tensor_metadata(
++            metadata, tname, &info.header);
++
++        if (orig_type == GGML_TYPE_COUNT) {
++            throw std::runtime_error(
++                format("EOQ tensor '%s' has invalid or missing metadata", tname));
++        }
++
++        // Record the compressed on-disk size BEFORE we change the type.
++        // ggml_nbytes(tensor) while type==EOQ gives us the compressed size
++        // because blck_size=1 and type_size=1 for EOQ (from patch 02).
++        info.on_disk_size = ggml_nbytes(tensor);
++
++        // Change the tensor type to the original quantization type.
++        // This makes ggml_nbytes() return the UNCOMPRESSED size, which
++        // is what buffer allocation, graph construction, and inference
++        // all need.
++        tensor->type = orig_type;
++
++        // Recalculate nb[] (byte strides) for the new type.
++        // ne[] (element counts) remain the same -- the logical shape
++        // does not change, only the encoding.
++        tensor->nb[0] = ggml_type_size(orig_type);
++        for (int dim = 1; dim < GGML_MAX_DIMS; dim++) {
++            tensor->nb[dim] = tensor->nb[dim - 1] * tensor->ne[dim - 1];
++        }
++
++        // For block-quantized types, nb[0] should be type_size and
++        // ne[0] must be divisible by blck_size.  The GGUF file stores
++        // the logical element counts, so this should already be correct.
++        // We verify as a sanity check.
++        int64_t blck = ggml_blck_size(orig_type);
++        if (blck > 1) {
++            // For quantized types, nb[0] = type_size (size of one block)
++            // and ne[0] must be a multiple of blck_size.
++            tensor->nb[0] = ggml_type_size(orig_type);
++            // nb[1] = nb[0] * (ne[0] / blck_size)
++            tensor->nb[1] = tensor->nb[0] * (tensor->ne[0] / blck);
++            for (int dim = 2; dim < GGML_MAX_DIMS; dim++) {
++                tensor->nb[dim] = tensor->nb[dim - 1] * tensor->ne[dim - 1];
++            }
++        }
++
++        // Stash the EOQ info for load_all_data() to use later.
++        eoq_tensors[tname] = info;
++
++        LLAMA_LOG_INFO("%s: EOQ tensor '%s' -> %s, "
++                      "disk=%zu bytes, memory=%zu bytes (%.1f%% compression)\n",
++                      __func__, tname,
++                      ggml_type_name(orig_type),
++                      info.on_disk_size,
++                      (size_t)ggml_nbytes(tensor),
++                      100.0 * (1.0 - (double)info.on_disk_size / (double)ggml_nbytes(tensor)));
++    }
++#endif // GGML_EOQ
+
+ // === END INSERTED CODE (constructor) ===
+
+
+ // =====================================================================
+ // Modification to llama_model_loader::load_all_data()
+ // =====================================================================
+ //
+ // The main tensor data loading loop in load_all_data() iterates over
+ // all tensors and copies data from the file (or mmap) into the
+ // allocated tensor buffers.  For EOQ tensors, the on-disk data is
+ // compressed and smaller than the in-memory buffer.
+ //
+ // We intercept the loading at line ~1505 of load_all_data(), inside
+ // the per-tensor loop:
+ //
+ //   for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx);
+ //        cur != NULL;
+ //        cur = ggml_get_next_tensor(ctx, cur))
+ //
+ // After "const auto * weight = get_weight(ggml_get_name(cur));" and
+ // before the existing mmap/read logic, we check if this tensor was
+ // originally EOQ and needs decompression.
+ //
+ // Key insight: By this point, cur->type has already been changed to
+ // the original type (in the constructor).  So ggml_nbytes(cur) gives
+ // the UNCOMPRESSED size.  But weight->offs and the file contain the
+ // COMPRESSED data at the original offset.  We use the eoq_tensors
+ // map to know (a) that this tensor needs decoding and (b) how many
+ // compressed bytes to read.
+ //
+ // ------------------------------------------------------------------
+ //
+ // Insert this block at the beginning of the per-tensor loop body,
+ // right after the weight==nullptr check and progress callback,
+ // REPLACING the normal n_size / read / mmap logic for EOQ tensors:
+
+ // === BEGIN INSERTED CODE (in load_all_data, inside per-tensor loop) ===
+ //
+ // Context: 'cur' is the current ggml_tensor*, 'weight' is the
+ // llama_tensor_weight* with file offset info.
+
++#ifdef GGML_EOQ
++    {
++        auto eoq_it = eoq_tensors.find(ggml_get_name(cur));
++        if (eoq_it != eoq_tensors.end()) {
++            // This tensor was GGML_TYPE_EOQ on disk.  Decompress it.
++            const eoq_tensor_info & eoq_info = eoq_it->second;
++            const size_t compressed_size = eoq_info.on_disk_size;
++            const size_t uncompressed_size = ggml_nbytes(cur);
++
++            LLAMA_LOG_DEBUG("%s: decompressing EOQ tensor '%s': "
++                           "%zu -> %zu bytes\n",
++                           __func__, ggml_get_name(cur),
++                           compressed_size, uncompressed_size);
++
++            // Step 1: Read the compressed data from the file.
++            //
++            // We always read into a temporary buffer regardless of
++            // whether mmap is enabled, because we need to decompress
++            // before writing to the tensor.  (Mmap gives us a pointer
++            // to the compressed data which we could use directly, but
++            // we still need a separate output buffer.)
++
++            const uint8_t * compressed_data = nullptr;
++            std::vector<uint8_t> compressed_buf;
++
++            if (use_mmap) {
++                // With mmap, the data is already in memory.
++                const auto & mapping = mappings.at(weight->idx);
++                compressed_data = (const uint8_t *)mapping->addr() + weight->offs;
++            } else {
++                // Without mmap, read from file into a temporary buffer.
++                compressed_buf.resize(compressed_size);
++                const auto & file = files.at(weight->idx);
++                file->seek(weight->offs, SEEK_SET);
++                file->read_raw(compressed_buf.data(), compressed_size);
++                compressed_data = compressed_buf.data();
++            }
++
++            // Step 2: Allocate a temporary buffer for the decompressed
++            // output.  We decompress into this buffer first, then copy
++            // to the tensor's backend buffer (which may be on GPU).
+
++            std::vector<uint8_t> decompressed_buf(uncompressed_size);
+
++            // Step 3: Call the rANS decoder.
++            //
++            // eoq_decode_tensor() reads the freq table, block offsets,
++            // and compressed stream from the compressed_data pointer.
++            // It writes uncompressed_size bytes of standard quant
++            // block data to the output buffer.
+
++            int rc = eoq_decode_tensor(
++                &eoq_info.header,
++                compressed_data,
++                decompressed_buf.data());
++
++            if (rc != 0) {
++                throw std::runtime_error(
++                    format("failed to decompress EOQ tensor '%s'",
++                           ggml_get_name(cur)));
++            }
+
++            // Step 4: Validate the decompressed data (if enabled).
+
++            if (check_tensors) {
++                if (!ggml_validate_row_data(cur->type,
++                                            decompressed_buf.data(),
++                                            uncompressed_size)) {
++                    throw std::runtime_error(
++                        format("tensor '%s' has invalid data after "
++                               "EOQ decompression", ggml_get_name(cur)));
++                }
++            }
+
++            // Step 5: Copy decompressed data to the tensor's buffer.
++            //
++            // ggml_backend_tensor_set handles the case where the tensor
++            // is on a non-host backend (e.g., GPU) by performing the
++            // appropriate host->device transfer.
+
++            if (use_mmap) {
++                // For mmap, the tensor may not have a buffer allocated
++                // yet.  Allocate it first using the decompressed data.
++                ggml_backend_buffer_t buf_mmap = nullptr;
++                if (bufs.count(weight->idx)) {
++                    buf_mmap = bufs.at(weight->idx);
++                }
++                if (buf_mmap && cur->data == nullptr) {
++                    // We cannot use ggml_backend_tensor_alloc with the
++                    // mmap pointer because it points to compressed data.
++                    // Allocate with a dummy, then overwrite.
++                    ggml_backend_tensor_alloc(buf_mmap, cur,
++                        (void *)compressed_data);
++                }
++                // Now overwrite with decompressed data.
++                ggml_backend_tensor_set(cur, decompressed_buf.data(),
++                                        0, uncompressed_size);
++            } else {
++                if (ggml_backend_buffer_is_host(cur->buffer)) {
++                    // Direct copy for host buffers.
++                    memcpy(cur->data, decompressed_buf.data(),
++                           uncompressed_size);
++                } else {
++                    // For device buffers, use the backend transfer API.
++                    ggml_backend_tensor_set(cur, decompressed_buf.data(),
++                                            0, uncompressed_size);
++                }
++            }
+
++            // Update mmap tracking if applicable.
++            if (use_mmap) {
++                auto & mmap_used = mmaps_used[weight->idx];
++                mmap_used.first  = std::min(mmap_used.first,  weight->offs);
++                mmap_used.second = std::max(mmap_used.second,
++                                            weight->offs + compressed_size);
++            }
+
++            // Account for the on-disk size in the progress counter.
++            // We add compressed_size (not uncompressed) because
++            // size_data was computed from the on-disk file layout.
++            size_done += compressed_size;
++            n_eoq_decoded++;
+
++            // Skip the normal (non-EOQ) loading code below.
++            continue;
++        }
++    }
++#endif // GGML_EOQ
+
+ // === END INSERTED CODE (load_all_data) ===
+ //
+ // After this continue, the normal mmap/read code path runs for
+ // non-EOQ tensors exactly as before.  No existing behavior is changed.
+
+
+ // =====================================================================
+ // Modification to the ftype detection logic in the constructor
+ // =====================================================================
+ //
+ // The constructor has a loop (around line ~707) that determines the
+ // file's ftype by counting how many tensors use each ggml_type and
+ // picking the most common one.  Because we change EOQ tensors to
+ // their original type in the constructor BEFORE this loop runs (the
+ // type change happens during tensor creation, which populates
+ // weights_map), the ftype detection naturally picks up the original
+ // types.
+ //
+ // However, for the switch statement that maps type_max to ftype, we
+ // add an explicit case for GGML_TYPE_EOQ as a safety net.  If for
+ // some reason an EOQ tensor slips through without being decoded
+ // (shouldn't happen), this makes the error obvious.
+ //
+ // Location: in the switch(type_max) block after the weights_map loop.
+
+ // === BEGIN INSERTED CODE (in constructor, ftype switch) ===
+
++#ifdef GGML_EOQ
++        case GGML_TYPE_EOQ:
++            // If we get here, it means some tensors were not decoded.
++            // This is a bug -- log an error and set ftype to EOQ so
++            // it's obvious in the output.
++            LLAMA_LOG_ERROR("%s: WARNING: %u tensors still have type EOQ "
++                           "after loading.  This indicates a loader bug.\n",
++                           __func__, n_type[GGML_TYPE_EOQ]);
++            ftype = LLAMA_FTYPE_MOSTLY_EOQ;
++            break;
++#endif
+
+ // === END INSERTED CODE (ftype switch) ===
+
+
+ // =====================================================================
+ // Summary log at end of load_all_data()
+ // =====================================================================
+ //
+ // At the end of load_all_data(), after all tensors have been loaded
+ // and validated, emit a summary of EOQ decompression.
+ //
+ // Location: right before the final "if (size_done >= size_data)"
+ // block, around line ~1651.
+
+ // === BEGIN INSERTED CODE (end of load_all_data) ===
+
++#ifdef GGML_EOQ
++    if (n_eoq_decoded > 0) {
++        size_t total_compressed = 0;
++        size_t total_uncompressed = 0;
++        for (const auto & [name, info] : eoq_tensors) {
++            total_compressed   += info.on_disk_size;
++            total_uncompressed += info.header.uncompressed_size;
++        }
++        LLAMA_LOG_INFO("%s: decoded %zu EOQ tensors: %.1f MiB compressed "
++                      "-> %.1f MiB uncompressed (%.1f%% disk savings)\n",
++                      __func__,
++                      n_eoq_decoded,
++                      (double)total_compressed / (1024.0 * 1024.0),
++                      (double)total_uncompressed / (1024.0 * 1024.0),
++                      100.0 * (1.0 - (double)total_compressed
++                                    / (double)total_uncompressed));
++    }
++#endif
+
+ // === END INSERTED CODE (summary log) ===
+
+
+ // =====================================================================
+ // Modification to llama_tensor_weight constructor
+ // =====================================================================
+ //
+ // The llama_tensor_weight constructor (in llama-model-loader.h, line
+ // ~39) computes the tensor data offset and validates that the tensor
+ // data fits within the file.  For EOQ tensors, the on-disk size
+ // differs from ggml_nbytes(tensor) because by the time this
+ // constructor runs, we have already changed the tensor's type back
+ // to the original type (uncompressed).
+ //
+ // We must use the compressed size from GGUF for the bounds check.
+ //
+ // Location: in the llama_tensor_weight constructor, at the file
+ // bounds validation (line ~46).
+
+ // === BEGIN INSERTED CODE (llama_tensor_weight constructor) ===
+ //
+ // Replace the bounds check:
+ //   if (offs + ggml_nbytes(tensor) < offs ||
+ //       offs + ggml_nbytes(tensor) > file->size())
+ //
+ // With:
+
++    // Determine the on-disk size for this tensor.  For EOQ tensors,
++    // the on-disk size is the compressed size (stored in GGUF tensor
++    // info), which is smaller than ggml_nbytes(tensor) (the
++    // uncompressed in-memory size).
++    size_t n_bytes_on_disk = ggml_nbytes(tensor);
++
++#ifdef GGML_EOQ
++    if (gguf_get_tensor_type(gguf_ctx, tensor_idx) == GGML_TYPE_EOQ) {
++        // The GGUF tensor size reflects the compressed data.
++        n_bytes_on_disk = gguf_get_tensor_size(gguf_ctx, tensor_idx);
++    }
++#endif
++
++    if (offs + n_bytes_on_disk < offs ||
++        offs + n_bytes_on_disk > file->size()) {
++        throw std::runtime_error(format(
++            "tensor '%s' data is not within the file bounds, "
++            "model is corrupted or incomplete",
++            ggml_get_name(tensor)));
++    }
+
+ // === END INSERTED CODE (llama_tensor_weight) ===
+
+
+ // =====================================================================
+ // Modification to size_data accumulation
+ // =====================================================================
+ //
+ // When the loader accumulates size_data (used for progress reporting),
+ // it sums ggml_nbytes() for each tensor.  For EOQ tensors, the
+ // relevant progress metric is the on-disk (compressed) size, since
+ // that determines I/O time.
+ //
+ // Location: wherever size_data += ggml_nbytes(cur) appears for
+ // weight tensors (typically in create_tensor, around line ~1270).
+
+ // === BEGIN INSERTED CODE (size_data adjustment) ===
+
++#ifdef GGML_EOQ
++    // For EOQ tensors, accumulate compressed size for progress tracking.
++    auto eoq_it = eoq_tensors.find(ggml_get_name(cur));
++    if (eoq_it != eoq_tensors.end()) {
++        size_data += eoq_it->second.on_disk_size;
++    } else
++#endif
++    {
++        size_data += ggml_nbytes(cur);
++    }
+
+ // === END INSERTED CODE (size_data adjustment) ===
+
+
+ // =====================================================================
+ // Applying this patch
+ // =====================================================================
+ //
+ // Because the exact line numbers depend on the llama.cpp revision
+ // checked out, this patch uses descriptive anchors rather than exact
+ // offsets.  To apply:
+ //
+ // 1. Open src/llama-model-loader.h
+ //    - Add the #include "eoq_ggml.h" near the top (inside #ifdef GGML_EOQ)
+ //    - Add the eoq_tensor_info struct and eoq_tensors map to the
+ //      llama_model_loader struct (after the n_tensors_moved field)
+ //
+ // 2. Open src/llama-model-loader.cpp
+ //    - Add the #include "eoq_ggml.h" at the top
+ //    - Add the eoq_read_tensor_metadata() helper function before the
+ //      constructor
+ //    - In the constructor's tensor initialization loop, add the EOQ
+ //      type detection block after each tensor is created
+ //    - In the constructor's ftype switch, add the GGML_TYPE_EOQ case
+ //    - In the llama_tensor_weight constructor, modify the bounds check
+ //    - In load_all_data()'s per-tensor loop, add the EOQ decompression
+ //      block at the top (after the nullptr/progress checks)
+ //    - At the end of load_all_data(), add the summary log
+ //    - In create_tensor(), adjust size_data accumulation
+ //
+ // 3. Ensure eoq_ggml.h and eoq_rans_v2.c are in the include/source
+ //    paths as specified by patch 04 (CMakeLists.txt).
+ //
+ // 4. Build with -DGGML_EOQ=ON (enabled by default per patch 04).
+ //
+ // All changes are guarded by #ifdef GGML_EOQ so the code compiles
+ // cleanly without the EOQ feature.
+---

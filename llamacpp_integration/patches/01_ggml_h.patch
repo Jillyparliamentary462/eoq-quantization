@@ -1,0 +1,87 @@
+From: dct-quantization project <dct-quantization@local>
+Subject: [PATCH 01/XX] ggml.h: add GGML_TYPE_EOQ transport type and GGML_FTYPE_MOSTLY_EOQ
+Date: 2026-03-28
+
+Add the EOQ (Entropy-Optimized Quantization) transport type to the GGML
+type system. EOQ is NOT a real quantization type -- it is a transport
+compression format that wraps existing quantized tensors with rANS-based
+entropy coding for smaller GGUF file sizes.
+
+Design invariants:
+
+  1. GGML_TYPE_EOQ is used ONLY in GGUF files on disk. It tells the
+     loader "this tensor blob is rANS-encoded; decode it first."
+
+  2. During model loading, every tensor marked GGML_TYPE_EOQ must be
+     decoded (rANS decompress -> recover original quant blocks) and its
+     type changed back to the original (e.g. Q4_K, Q6_K, Q8_0, etc.).
+     The original type is stored in the EOQ block header.
+
+  3. After loading completes, NO tensor in memory may have type
+     GGML_TYPE_EOQ. If any remain, it is a loader bug.
+
+  4. No compute kernels (vec_dot, mul_mat, etc.) exist for EOQ.
+     The type_traits entry has is_quantized=false, blck_size=1,
+     type_size=1, and null function pointers (see 02_ggml_c.patch).
+     This ensures any accidental use at runtime triggers an immediate
+     assertion failure rather than silent corruption.
+
+GGML_FTYPE_MOSTLY_EOQ follows the same pattern -- it signals that the
+GGUF file predominantly contains EOQ-wrapped tensors. After loading,
+the effective ftype is determined by the original types recovered from
+the EOQ containers.
+
+---
+ ggml/include/ggml.h | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+NOTE: This is a descriptive patch. The exact line numbers depend on the
+version of llama.cpp you are patching against. The context lines show
+the surrounding code to locate each hunk. Adjust offsets as needed for
+your checkout. See README.md in this directory for application guidance.
+
+Base reference: ggml-org/llama.cpp post-TurboQuant merge (TBQ3_0=41,
+TBQ4_0=42, GGML_TYPE_COUNT=43).
+
+================================================================================
+HUNK 1: enum ggml_type -- add GGML_TYPE_EOQ, bump GGML_TYPE_COUNT
+================================================================================
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 0000000..1111111 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -XXX,7 +XXX,13 @@ enum ggml_type {
+         GGML_TYPE_NVFP4   = 40,
+         GGML_TYPE_TBQ3_0  = 41,
+         GGML_TYPE_TBQ4_0  = 42,
+-        GGML_TYPE_COUNT   = 43,
++
++        // EOQ transport compression -- NOT a compute type.
++        // Used only in GGUF files on disk. Tensors are rANS-encoded blocks
++        // that must be decoded to their original quant type during loading.
++        // After loading, no tensor should remain as GGML_TYPE_EOQ.
++        GGML_TYPE_EOQ     = 43,
++
++        GGML_TYPE_COUNT   = 44,
+     };
+
+================================================================================
+HUNK 2: enum ggml_ftype -- add GGML_FTYPE_MOSTLY_EOQ
+================================================================================
+
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -XXX,6 +XXX,11 @@ enum ggml_ftype {
+         GGML_FTYPE_MOSTLY_IQ4_XS         = 22,
+         GGML_FTYPE_MOSTLY_IQ1_M          = 23,
+         GGML_FTYPE_MOSTLY_BF16           = 24,
++        GGML_FTYPE_MOSTLY_TQ1_0          = 25, // if not already present
++        GGML_FTYPE_MOSTLY_TQ2_0          = 26, // if not already present
++
++        // EOQ: file-level flag indicating tensors use entropy-coded transport.
++        // After loading, the real ftype is whatever the decoded tensors use.
++        GGML_FTYPE_MOSTLY_EOQ            = 29,
+     };
+
+--- end of patch ---

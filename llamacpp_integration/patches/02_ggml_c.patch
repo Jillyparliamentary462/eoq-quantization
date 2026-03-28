@@ -1,0 +1,21 @@
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -904,6 +904,17 @@
+         .type_size                = 0,
+         .is_quantized             = false,
+     },
++    // GGML_TYPE_EOQ is a transport-only (file format) type for entropy-coded
++    // quantized weights.  At model load time the compressed payload is decoded
++    // and the tensor type is changed back to its original type (Q4_K, Q5_K, …).
++    // Tensors must NEVER exist as GGML_TYPE_EOQ at compute / inference time.
++    [GGML_TYPE_EOQ] = {
++        .type_name                = "eoq",
++        .blck_size                = 1,          // not meaningful for transport type
++        .type_size                = 1,          // byte-level compressed data
++        .is_quantized             = false,      // not a quantization format
++        .to_float                 = NULL,        // cannot dequantize directly
++        .from_float_ref           = NULL,        // cannot quantize to EOQ via ggml
++    },
+ };
+
+ const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {

@@ -1,0 +1,664 @@
+From: dct-quantization project <dct-quantization@local>
+Subject: [PATCH 05/XX] quantize: add --eoq and --eoq-compress flags for EOQ transport compression
+Date: 2026-03-28
+
+Add EOQ (Entropy-Optimized Quantization) transport compression as an
+optional post-processing step in the llama-quantize tool.
+
+Two usage modes:
+
+  1. Quantize-and-compress in one step:
+       ./llama-quantize model.gguf model-eoq.gguf Q4_K_M --eoq
+
+     This performs standard quantization to Q4_K_M, then applies rANS
+     entropy coding to each quantized tensor before writing the GGUF.
+
+  2. Compress an already-quantized GGUF:
+       ./llama-quantize model-q4.gguf model-eoq.gguf --eoq-compress
+
+     This reads an existing quantized GGUF and applies rANS compression
+     to every eligible tensor, producing an EOQ-compressed GGUF.
+
+In both modes the output file contains tensors with type GGML_TYPE_EOQ.
+Each tensor blob stores an eoq_tensor_header_t followed by the per-tensor
+frequency table and rANS-encoded data.  At load time, the EOQ decode path
+(added in patches 01-03) recovers the original quant blocks with zero
+quality loss.
+
+File-level GGUF metadata keys added:
+  - general.file_type        = GGML_FTYPE_MOSTLY_EOQ
+  - eoq.version              = 1
+  - eoq.precision_bits       = 14  (configurable via --eoq-precision)
+  - eoq.rans_block_size      = 4096 (configurable via --eoq-block-size)
+  - eoq.original_ftype       = <the underlying quantization ftype>
+
+---
+ tools/quantize/quantize.cpp      |  ~90 lines added
+ src/llama-quant.cpp               | ~180 lines added
+ include/llama.h                   |   ~5 lines added
+ 3 files changed, ~275 insertions(+)
+
+NOTE: This is a descriptive pseudo-code patch. The exact line numbers
+depend on the version of llama.cpp you are patching against. The context
+lines show the surrounding code to locate each hunk. Adjust offsets as
+needed for your checkout.
+
+Base reference: ggml-org/llama.cpp with EOQ type system patches 01-04
+already applied (GGML_TYPE_EOQ = 43, GGML_FTYPE_MOSTLY_EOQ = 29).
+
+Requires: eoq_rans_v2.h / eoq_rans_v2.c linked into the build (patch 04).
+
+================================================================================
+FILE 1: include/llama.h -- extend llama_model_quantize_params
+================================================================================
+
+diff --git a/include/llama.h b/include/llama.h
+index 0000000..1111111 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -XXX,6 +XXX,11 @@ typedef struct llama_model_quantize_params {
+         void * kv_overrides;                  // pointer to vector containing overrides
+         void * tensor_types;                  // pointer to vector containing tensor types
+         void * prune_layers;                  // pointer to vector containing layer indices to prune
++
++        // EOQ transport compression options
++        bool   eoq_compress;                  // if true, apply rANS entropy coding after quantization
++        uint32_t eoq_precision_bits;          // rANS CDF precision (0 = default 14)
++        uint32_t eoq_rans_block_size;         // symbols per rANS block (0 = default 4096)
+     } llama_model_quantize_params;
+
+
+================================================================================
+FILE 2: tools/quantize/quantize.cpp -- CLI argument parsing
+================================================================================
+
+HUNK 2a: Add #include for eoq header (top of file, after existing includes)
+-------------------------------------------------------------------------
+
+--- a/tools/quantize/quantize.cpp
++++ b/tools/quantize/quantize.cpp
+@@ -3,6 +3,10 @@
+ #include "gguf.h"
+
++#ifdef GGML_EOQ
++#include "eoq_rans_v2.h"
++#endif
++
+ #include <algorithm>
+
+
+HUNK 2b: Add --eoq / --eoq-compress to usage() help text
+----------------------------------------------------------
+
+--- a/tools/quantize/quantize.cpp
++++ b/tools/quantize/quantize.cpp
+@@ -XXX,6 +XXX,18 @@ static void usage(const char * executable) {
+     printf("  --dry-run\n");
+     printf("                                      calculate and show the final quantization size without performing quantization\n");
+     printf("                                      example: llama-quantize --dry-run model-f32.gguf Q4_K\n\n");
++#ifdef GGML_EOQ
++    printf("  --eoq\n");
++    printf("                                      apply EOQ transport compression after quantization\n");
++    printf("                                      output file will have ~15-60%% smaller tensors, losslessly recovered at load time\n");
++    printf("  --eoq-compress\n");
++    printf("                                      compress an already-quantized GGUF with EOQ (no ftype argument needed)\n");
++    printf("                                      usage: llama-quantize --eoq-compress input.gguf output-eoq.gguf\n");
++    printf("  --eoq-precision N\n");
++    printf("                                      rANS CDF precision bits (default: 14, range: 12-16)\n");
++    printf("  --eoq-block-size N\n");
++    printf("                                      symbols per rANS block (default: 4096)\n");
++#endif
+     printf("note: --include-weights and --exclude-weights cannot be used together\n\n");
+
+
+HUNK 2c: Parse --eoq, --eoq-compress, --eoq-precision, --eoq-block-size in the options loop
+----------------------------------------------------------------------------------------------
+
+Insert these cases inside the for-loop that parses "--" options, right
+before the final else clause that calls usage():
+
+--- a/tools/quantize/quantize.cpp
++++ b/tools/quantize/quantize.cpp
+@@ -XXX,6 +XXX,38 @@ int main(int argc, char ** argv) {
++    // --- EOQ state ---
++    bool eoq_compress_only = false;  // --eoq-compress mode (no ftype needed)
++
+
+     for (; arg_idx < argc && strncmp(argv[arg_idx], "--", 2) == 0; arg_idx++) {
+         // ... existing option parsing ...
+
+         } else if (strcmp(argv[arg_idx], "--keep-split") == 0) {
+             params.keep_split = true;
++#ifdef GGML_EOQ
++        } else if (strcmp(argv[arg_idx], "--eoq") == 0) {
++            params.eoq_compress = true;
++        } else if (strcmp(argv[arg_idx], "--eoq-compress") == 0) {
++            params.eoq_compress = true;
++            eoq_compress_only = true;
++        } else if (strcmp(argv[arg_idx], "--eoq-precision") == 0) {
++            if (arg_idx < argc-1) {
++                int val = std::stoi(argv[++arg_idx]);
++                if (val < 12 || val > 16) {
++                    fprintf(stderr, "%s: --eoq-precision must be 12-16, got %d\n", __func__, val);
++                    return 1;
++                }
++                params.eoq_precision_bits = (uint32_t)val;
++            } else {
++                usage(argv[0]);
++            }
++        } else if (strcmp(argv[arg_idx], "--eoq-block-size") == 0) {
++            if (arg_idx < argc-1) {
++                params.eoq_rans_block_size = (uint32_t)std::stoi(argv[++arg_idx]);
++            } else {
++                usage(argv[0]);
++            }
++#endif
+         } else {
+             usage(argv[0]);
+         }
+     }
+
+
+HUNK 2d: Handle --eoq-compress mode (post-processing path, no ftype needed)
+------------------------------------------------------------------------------
+
+Insert right after the options loop ends and before the existing ftype
+parsing logic:
+
+--- a/tools/quantize/quantize.cpp
++++ b/tools/quantize/quantize.cpp
+@@ -XXX,6 +XXX,30 @@
++#ifdef GGML_EOQ
++    if (eoq_compress_only) {
++        // --eoq-compress mode: input.gguf output-eoq.gguf
++        // No quantization type needed -- just compress existing tensors.
++        if (argc - arg_idx < 2) {
++            fprintf(stderr, "%s: --eoq-compress requires <input.gguf> <output.gguf>\n", __func__);
++            return 1;
++        }
++        const std::string fname_inp = argv[arg_idx];
++        const std::string fname_out = argv[arg_idx + 1];
++
++        fprintf(stderr, "%s: EOQ compressing '%s' -> '%s'\n", __func__, fname_inp.c_str(), fname_out.c_str());
++        fprintf(stderr, "%s: precision_bits=%u, rans_block_size=%u\n", __func__,
++                params.eoq_precision_bits ? params.eoq_precision_bits : 14u,
++                params.eoq_rans_block_size ? params.eoq_rans_block_size : 4096u);
++
++        llama_backend_init();
++        params.only_copy = true;  // don't re-quantize, just copy+compress
++
++        if (llama_model_quantize(fname_inp.c_str(), fname_out.c_str(), &params)) {
++            fprintf(stderr, "%s: failed to EOQ-compress model\n", __func__);
++            return 1;
++        }
++        llama_backend_free();
++        return 0;
++    }
++#endif
++
+     if (argc - arg_idx < 2) {
+         printf("%s: bad arguments\n", argv[0]);
+         usage(argv[0]);
+
+
+HUNK 2e: After normal quantize call, print EOQ info if --eoq was used
+----------------------------------------------------------------------
+
+--- a/tools/quantize/quantize.cpp
++++ b/tools/quantize/quantize.cpp
+@@ -XXX,6 +XXX,12 @@
+     // report timing
+     {
+         const int64_t t_main_end_us = llama_time_us();
+
+         printf("\n");
+         printf("%s: quantize time = %8.2f ms\n", __func__, t_quantize_us/1000.0);
+         printf("%s:    total time = %8.2f ms\n", __func__, (t_main_end_us - t_main_start_us)/1000.0);
++#ifdef GGML_EOQ
++        if (params.eoq_compress) {
++            printf("%s: EOQ transport compression was applied (precision=%u, block_size=%u)\n",
++                   __func__,
++                   params.eoq_precision_bits ? params.eoq_precision_bits : 14u,
++                   params.eoq_rans_block_size ? params.eoq_rans_block_size : 4096u);
++        }
++#endif
+     }
+
+
+================================================================================
+FILE 3: src/llama-quant.cpp -- quantization logic with EOQ compression
+================================================================================
+
+HUNK 3a: Add #include and EOQ encoder constants (top of file)
+--------------------------------------------------------------
+
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -14,6 +14,20 @@
+ #include <unordered_map>
+
++#ifdef GGML_EOQ
++#include "eoq_rans_v2.h"
++
++// GGUF metadata key names for EOQ
++static const char * const LLM_KV_EOQ_VERSION          = "eoq.version";
++static const char * const LLM_KV_EOQ_PRECISION_BITS   = "eoq.precision_bits";
++static const char * const LLM_KV_EOQ_RANS_BLOCK_SIZE  = "eoq.rans_block_size";
++static const char * const LLM_KV_EOQ_ORIGINAL_FTYPE   = "eoq.original_ftype";
++
++// Encoder defaults
++static const uint32_t EOQ_DEFAULT_PRECISION_BITS  = 14;
++static const uint32_t EOQ_DEFAULT_RANS_BLOCK_SIZE = 4096;
++static const uint32_t EOQ_ALPHABET_SIZE           = 256;  // byte-level coding
++#endif
++
+
+HUNK 3b: Add the rANS encoder function (encode-side, only needed at quantize time)
+------------------------------------------------------------------------------------
+
+Insert before llama_model_quantize_impl():
+
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -XXX,6 +XXX,140 @@
+
++#ifdef GGML_EOQ
++// =========================================================================
++// EOQ rANS Encoder -- used only at quantize-time to produce compressed GGUF
++// =========================================================================
++//
++// This is a straightforward single-stream rANS encoder. Performance is
++// not critical here (runs once offline), so we favor clarity over speed.
++// The wire format is identical to what eoq_decode_tensor_v2() expects.
++
++struct eoq_encode_result {
++    std::vector<uint8_t> data;           // complete blob: header + freq_table + block_offsets + compressed
++    eoq_tensor_header_t  header;         // also returned separately for convenience
++    double               compression_ratio;
++};
++
++// Count byte frequencies in a raw tensor blob.
++static void eoq_count_frequencies(
++    const uint8_t * data,
++    size_t          data_size,
++    uint64_t        freq_raw[256])
++{
++    memset(freq_raw, 0, 256 * sizeof(uint64_t));
++    for (size_t i = 0; i < data_size; ++i) {
++        freq_raw[data[i]]++;
++    }
++}
++
++// Normalize raw counts to sum to M = 1 << precision_bits.
++// Every symbol present in the input gets at least frequency 1.
++// Returns the normalized freq table as uint16_t[256].
++static void eoq_normalize_freq(
++    const uint64_t  raw[256],
++    uint32_t        precision_bits,
++    uint16_t        norm[256])
++{
++    const uint32_t M = 1u << precision_bits;
++    uint64_t total = 0;
++    for (int i = 0; i < 256; ++i) total += raw[i];
++    if (total == 0) {
++        // Degenerate: no data. Uniform distribution.
++        for (int i = 0; i < 256; ++i) norm[i] = M / 256;
++        norm[0] += M - 256 * (M / 256);  // fixup remainder
++        return;
++    }
++
++    uint32_t assigned = 0;
++    int n_nonzero = 0;
++    for (int i = 0; i < 256; ++i) {
++        if (raw[i] > 0) {
++            norm[i] = (uint16_t)std::max(1u, (uint32_t)((raw[i] * M) / total));
++            n_nonzero++;
++        } else {
++            norm[i] = 0;
++        }
++        assigned += norm[i];
++    }
++
++    // Adjust the largest-frequency symbol to make the sum exactly M.
++    int max_idx = 0;
++    for (int i = 1; i < 256; ++i) {
++        if (norm[i] > norm[max_idx]) max_idx = i;
++    }
++    if (assigned < M) {
++        norm[max_idx] += (M - assigned);
++    } else if (assigned > M) {
++        // Should not underflow below 1 for the max symbol.
++        uint32_t excess = assigned - M;
++        if (norm[max_idx] > excess + 1) {
++            norm[max_idx] -= (uint16_t)excess;
++        } else {
++            // Spread the reduction across multiple symbols (rare edge case).
++            for (int i = 0; i < 256 && excess > 0; ++i) {
++                if (norm[i] > 1) {
++                    uint16_t reduce = (uint16_t)std::min((uint32_t)(norm[i] - 1), excess);
++                    norm[i] -= reduce;
++                    excess -= reduce;
++                }
++            }
++        }
++    }
++}
++
++// Single-stream rANS encode of a byte buffer.
++// Produces the wire-format blob that eoq_decode_tensor_v2() consumes.
++//
++// Wire format for the entire tensor:
++//   eoq_tensor_header_t  (28 bytes)
++//   uint16_t freq_table[256]  (512 bytes)
++//   uint32_t block_offsets[num_rans_blocks]
++//   compressed stream bytes (all blocks concatenated)
++//
++static eoq_encode_result eoq_encode_tensor(
++    const uint8_t * tensor_data,
++    size_t          tensor_size,
++    uint32_t        original_ggml_type,
++    uint32_t        precision_bits,
++    uint32_t        rans_block_size)
++{
++    eoq_encode_result result = {};
++
++    // Step 1: Compute byte-level frequency table for this tensor.
++    uint64_t freq_raw[256];
++    eoq_count_frequencies(tensor_data, tensor_size, freq_raw);
++
++    uint16_t freq_norm[256];
++    eoq_normalize_freq(freq_raw, precision_bits, freq_norm);
++
++    // Build CDF from normalized frequencies.
++    uint32_t cdf[257];
++    cdf[0] = 0;
++    for (int i = 0; i < 256; ++i) {
++        cdf[i + 1] = cdf[i] + freq_norm[i];
++    }
++
++    // Step 2: Divide input into rANS blocks and encode each.
++    const uint32_t num_blocks = (uint32_t)((tensor_size + rans_block_size - 1) / rans_block_size);
++    const uint32_t M = 1u << precision_bits;
++    const uint32_t RANS_L = M << 8;  // lower bound of rANS state interval
++
++    // We'll collect per-block compressed data, then assemble the final blob.
++    std::vector<std::vector<uint8_t>> block_streams(num_blocks);
++
++    for (uint32_t blk = 0; blk < num_blocks; ++blk) {
++        size_t blk_start = (size_t)blk * rans_block_size;
++        size_t blk_end   = std::min(blk_start + rans_block_size, tensor_size);
++        size_t blk_len   = blk_end - blk_start;
++
++        // rANS encoding processes symbols in REVERSE order.
++        // The renormalization bytes are emitted into a buffer that will be
++        // reversed at the end to produce the forward-readable stream.
++        std::vector<uint8_t> renorm_buf;
++        renorm_buf.reserve(blk_len * 2);  // generous upper bound
++
++        uint32_t state = RANS_L;
++
++        for (size_t j = blk_len; j-- > 0; ) {
++            uint8_t sym = tensor_data[blk_start + j];
++            uint32_t freq = freq_norm[sym];
++            uint32_t cum  = cdf[sym];
++
++            // Renormalize: while state >= freq * (RANS_L >> precision_bits) * 256,
++            // emit one byte from the low bits of state.
++            // Equivalently: state >= freq << (precision_bits + 8)  won't work for
++            // large precision_bits, so use the standard check:
++            uint32_t upper = ((RANS_L >> precision_bits) << 8) * freq;
++            while (state >= upper) {
++                renorm_buf.push_back((uint8_t)(state & 0xFF));
++                state >>= 8;
++            }
++
++            // rANS encode step:
++            //   state = (state / freq) * M + (state % freq) + cum
++            state = ((state / freq) << precision_bits) + (state % freq) + cum;
++        }
++
++        // Serialize final state + renorm stream.
++        // Wire format per block:
++        //   1 byte:  state_len (how many bytes encode the final state)
++        //   state_len bytes:  state (big-endian)
++        //   remaining bytes:  renormalization stream (reversed from renorm_buf)
++        std::vector<uint8_t> block_data;
++
++        // Encode state in big-endian, variable length.
++        uint8_t state_bytes[8];
++        int state_len = 0;
++        {
++            uint32_t s = state;
++            do {
++                state_bytes[state_len++] = (uint8_t)(s >> 24);
++                s <<= 8;
++            } while (s != 0 && state_len < 4);
++        }
++        block_data.push_back((uint8_t)state_len);
++        for (int k = 0; k < state_len; ++k) {
++            block_data.push_back(state_bytes[k]);
++        }
++
++        // Reverse renorm_buf to get forward-readable stream.
++        for (size_t k = renorm_buf.size(); k-- > 0; ) {
++            block_data.push_back(renorm_buf[k]);
++        }
++
++        block_streams[blk] = std::move(block_data);
++    }
++
++    // Step 3: Assemble the final blob.
++    //   header | freq_table | block_offsets | block_data...
++    size_t compressed_payload_size = 0;
++    for (auto & bs : block_streams) compressed_payload_size += bs.size();
++
++    size_t meta_size = sizeof(eoq_tensor_header_t) + 256 * sizeof(uint16_t) + num_blocks * sizeof(uint32_t);
++    size_t total_blob_size = meta_size + compressed_payload_size;
++
++    result.data.resize(total_blob_size);
++    uint8_t * out = result.data.data();
++
++    // Fill header.
++    eoq_tensor_header_t hdr = {};
++    hdr.original_type     = original_ggml_type;
++    hdr.num_blocks        = num_blocks;
++    hdr.freq_table_size   = EOQ_ALPHABET_SIZE;
++    hdr.precision_bits    = precision_bits;
++    hdr.rans_block_size   = rans_block_size;
++    hdr.compressed_size   = (uint32_t)total_blob_size;
++    hdr.uncompressed_size = (uint32_t)tensor_size;
++
++    memcpy(out, &hdr, sizeof(hdr));
++    out += sizeof(hdr);
++
++    // Frequency table.
++    memcpy(out, freq_norm, 256 * sizeof(uint16_t));
++    out += 256 * sizeof(uint16_t);
++
++    // Block offsets (byte offset of each block within the compressed payload area).
++    uint32_t running_offset = 0;
++    for (uint32_t blk = 0; blk < num_blocks; ++blk) {
++        uint32_t off = running_offset;
++        memcpy(out, &off, sizeof(uint32_t));
++        out += sizeof(uint32_t);
++        running_offset += (uint32_t)block_streams[blk].size();
++    }
++
++    // Block data.
++    for (uint32_t blk = 0; blk < num_blocks; ++blk) {
++        memcpy(out, block_streams[blk].data(), block_streams[blk].size());
++        out += block_streams[blk].size();
++    }
++
++    result.header = hdr;
++    result.compression_ratio = (tensor_size > 0) ? (double)total_blob_size / (double)tensor_size : 1.0;
++
++    return result;
++}
++
++// Determine whether a tensor is eligible for EOQ compression.
++// We compress quantized weight tensors but skip:
++//   - Already-EOQ tensors
++//   - F32/F16/BF16 tensors (small count, not worth compressing)
++//   - 1-D tensors (biases, norms -- tiny, not worth it)
++static bool eoq_tensor_eligible(const ggml_tensor * tensor) {
++    if (tensor->type == GGML_TYPE_EOQ)  return false;
++    if (tensor->type == GGML_TYPE_F32)  return false;
++    if (tensor->type == GGML_TYPE_F16)  return false;
++    if (tensor->type == GGML_TYPE_BF16) return false;
++    if (ggml_n_dims(tensor) < 2)        return false;
++    return ggml_is_quantized(tensor->type);
++}
++#endif  // GGML_EOQ
+
+
+HUNK 3c: Add eoq_compress field defaults to llama_model_quantize_default_params()
+----------------------------------------------------------------------------------
+
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -XXX,6 +XXX,12 @@ llama_model_quantize_params llama_model_quantize_default_params() {
+         /*.kv_overrides                =*/ nullptr,
+         /*.tensor_type                 =*/ nullptr,
+         /*.prune_layers                =*/ nullptr
++#ifdef GGML_EOQ
++        ,
++        /*.eoq_compress                =*/ false,
++        /*.eoq_precision_bits          =*/ 0,    // 0 means use default (14)
++        /*.eoq_rans_block_size         =*/ 0,    // 0 means use default (4096)
++#endif
+     };
+
+     return result;
+ }
+
+
+HUNK 3d: In llama_model_quantize_impl() -- set up EOQ metadata and post-compress
+----------------------------------------------------------------------------------
+
+Insert in llama_model_quantize_impl(), right after the GGUF KV pairs are
+set up (after gguf_set_val_u32 for general.file_type) and before the
+tensor iteration loop:
+
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -XXX,6 +XXX,24 @@
+     gguf_set_val_u32(ctx_out.get(), "general.quantization_version", GGML_QNT_VERSION);
+     gguf_set_val_u32(ctx_out.get(), "general.file_type", ftype);
+
++#ifdef GGML_EOQ
++    // --- EOQ compression configuration ---
++    const bool     do_eoq        = params->eoq_compress;
++    const uint32_t eoq_prec_bits = params->eoq_precision_bits  ? params->eoq_precision_bits  : EOQ_DEFAULT_PRECISION_BITS;
++    const uint32_t eoq_blk_size  = params->eoq_rans_block_size ? params->eoq_rans_block_size : EOQ_DEFAULT_RANS_BLOCK_SIZE;
++
++    if (do_eoq) {
++        LLAMA_LOG_INFO("%s: EOQ transport compression enabled (precision=%u, block_size=%u)\n",
++                       __func__, eoq_prec_bits, eoq_blk_size);
++        gguf_set_val_u32(ctx_out.get(), LLM_KV_EOQ_VERSION,         1);
++        gguf_set_val_u32(ctx_out.get(), LLM_KV_EOQ_PRECISION_BITS,  eoq_prec_bits);
++        gguf_set_val_u32(ctx_out.get(), LLM_KV_EOQ_RANS_BLOCK_SIZE, eoq_blk_size);
++        gguf_set_val_u32(ctx_out.get(), LLM_KV_EOQ_ORIGINAL_FTYPE,  (uint32_t)ftype);
++        // Override file-level ftype to signal EOQ-compressed file.
++        gguf_set_val_u32(ctx_out.get(), "general.file_type", GGML_FTYPE_MOSTLY_EOQ);
++    }
++
++    size_t total_size_eoq = 0;   // track compressed size for reporting
++    int    n_tensors_compressed = 0;
++#endif
++
+
+HUNK 3e: After each tensor is quantized and before writing to fout, apply EOQ compression
+------------------------------------------------------------------------------------------
+
+In the main loop, right after `new_size` is finalized and before the
+tensor data is written to the output file, wrap the tensor data in EOQ
+encoding if eligible:
+
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -XXX,6 +XXX,52 @@
+             total_size_org += tensor_size;
+             total_size_new += new_size;
+
++#ifdef GGML_EOQ
++            // ---- EOQ post-quantization compression ----
++            // After standard quantization (or copy), if --eoq is active and this
++            // tensor is eligible, encode it with rANS and change its type to EOQ.
++            std::vector<uint8_t> eoq_blob;  // must outlive the fout.write() below
++
++            if (do_eoq && eoq_tensor_eligible(tensor)) {
++                const uint32_t orig_type = (uint32_t)(quantize ? new_type : cur_type);
++
++                eoq_encode_result enc = eoq_encode_tensor(
++                    (const uint8_t *)new_data,
++                    new_size,
++                    orig_type,
++                    eoq_prec_bits,
++                    eoq_blk_size
++                );
++
++                if (enc.compression_ratio < 0.98) {
++                    // Compression is worthwhile (> 2% savings).
++                    eoq_blob = std::move(enc.data);
++                    new_data = eoq_blob.data();
++                    new_size = eoq_blob.size();
++
++                    // Change this tensor's type to EOQ in the output GGUF.
++                    gguf_set_tensor_type(ctx_outs[cur_split].get(), name.c_str(), GGML_TYPE_EOQ);
++
++                    LLAMA_LOG_INFO(" -> EOQ (%.1f%% of original, %s inside)",
++                                  enc.compression_ratio * 100.0,
++                                  ggml_type_name((ggml_type)orig_type));
++
++                    total_size_eoq += new_size;
++                    n_tensors_compressed++;
++                } else {
++                    // Compression ratio too poor -- keep uncompressed.
++                    LLAMA_LOG_INFO(" -> EOQ skipped (ratio=%.2f)", enc.compression_ratio);
++                }
++            }
++#endif
++
+             // update the gguf meta data as we go
+-            gguf_set_tensor_type(ctx_outs[cur_split].get(), name.c_str(), new_type);
++            // NOTE: tensor type may have been changed to GGML_TYPE_EOQ above;
++            // only set it here if EOQ didn't already set it.
++#ifdef GGML_EOQ
++            if (eoq_blob.empty()) {
++                gguf_set_tensor_type(ctx_outs[cur_split].get(), name.c_str(), new_type);
++            }
++#else
++            gguf_set_tensor_type(ctx_outs[cur_split].get(), name.c_str(), new_type);
++#endif
+             GGML_ASSERT(gguf_get_tensor_size(...) == new_size);
+             gguf_set_tensor_data(ctx_outs[cur_split].get(), name.c_str(), new_data);
+
+             // write tensor data + padding
+             fout.write((const char *) new_data, new_size);
+             zeros(fout, GGML_PAD(new_size, align) - new_size);
+
+
+HUNK 3f: After the main loop, report EOQ compression statistics
+-----------------------------------------------------------------
+
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -XXX,6 +XXX,18 @@
+     LLAMA_LOG_INFO("%s: model size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_org/1024.0/1024.0, total_size_org*8.0/ml.n_elements);
+     LLAMA_LOG_INFO("%s: quant size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_new/1024.0/1024.0, total_size_new*8.0/ml.n_elements);
+
++#ifdef GGML_EOQ
++    if (do_eoq && n_tensors_compressed > 0) {
++        // total_size_new already includes the EOQ-compressed sizes for compressed tensors
++        // and original sizes for non-compressed ones.
++        double ratio = (total_size_new > 0) ? (double)total_size_eoq / (double)total_size_new : 0.0;
++        LLAMA_LOG_INFO("%s: EOQ compressed %d tensor(s)\n", __func__, n_tensors_compressed);
++        LLAMA_LOG_INFO("%s: EOQ data size  = %8.2f MiB (%.1f%% of quant size)\n",
++                       __func__, total_size_eoq/1024.0/1024.0, ratio * 100.0);
++        LLAMA_LOG_INFO("%s: output file type = GGML_FTYPE_MOSTLY_EOQ (original ftype preserved in eoq.original_ftype)\n", __func__);
++    }
++#endif
++
+
+--- end of patch ---

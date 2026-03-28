@@ -9,3 +9,4 @@ results*/
 *.json
 !requirements.txt
 .DS_Store
+llamacpp_integration/llama.cpp

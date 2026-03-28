@@ -1,0 +1,30 @@
+--- a/ggml/src/CMakeLists.txt
++++ b/ggml/src/CMakeLists.txt
+@@ -1,3 +1,5 @@
++option(GGML_EOQ "Enable EOQ transport compression" ON)
++
+ cmake_minimum_required(VERSION 3.14)
+
+ #
+@@ -XXX,6 +XXX,20 @@
+     target_compile_definitions(ggml PUBLIC GGML_USE_CPU)
+ endif()
+
++# --- EOQ rANS transport compression ---
++if (GGML_EOQ)
++    set(GGML_SOURCES_EOQ
++        ${CMAKE_CURRENT_SOURCE_DIR}/eoq_rans_v2.c
++    )
++    set(GGML_HEADERS_EOQ
++        ${CMAKE_CURRENT_SOURCE_DIR}/../include/eoq_rans_v2.h
++        ${CMAKE_CURRENT_SOURCE_DIR}/../include/eoq_ggml.h
++    )
++    target_sources(ggml PRIVATE ${GGML_SOURCES_EOQ} ${GGML_HEADERS_EOQ})
++    target_include_directories(ggml PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../include)
++    target_compile_definitions(ggml PUBLIC GGML_EOQ)
++    message(STATUS "EOQ rANS transport compression: enabled")
++endif()
++
+ # install
+ install(TARGETS ggml
+         LIBRARY DESTINATION lib
