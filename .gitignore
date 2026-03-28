@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv*/
+models/
+*.gguf
+*.eoq
+*.eoq.gguf
+results*/
+*.json
+!requirements.txt
+.DS_Store
