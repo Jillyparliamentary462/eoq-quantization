@@ -11,6 +11,7 @@ Simple absmax quantization + rANS entropy coding that matches complex GGUF K-qua
 | Qwen3.5-4B | 8,412 MB | 2,398 MB | — | 7.58 | 7.77 | +0.18 | 54.1 |
 | Qwen3.5-27B | 53,792 MB | 15,353 MB | 27.3 GB | 5.65 | 5.64 | -0.01 | 6.2 |
 | **Qwen3.5-35B-A3B** | **69,321 MB** | **19,680 MB** | **35.2 GB** | **5.19** | **5.39** | **+0.20** | **30.2** |
+| GLM-4.7-Flash (30B MoE) | 59,887 MB | 30,400 MB | 30.4 GB | 37.71 | 41.12 | +3.41 | 3.2 |
 
 EOQ Q5 achieves **3.5x compression** with PPL degradation of only +0.18 to +0.83 points and **zero inference overhead** (identical tok/s to FP16). Compressed format halves download size (35.2 GB vs 69.3 GB for 35B model).
 
@@ -44,6 +45,7 @@ For speed improvement with reduced RAM, we developed custom CUDA INT4 kernels:
 | Qwen3.5-4B EOQ Q4/Q5/Q6 | [Q4](https://huggingface.co/caiovicentino1/Qwen3.5-4B-EOQ-Q4) [Q5](https://huggingface.co/caiovicentino1/Qwen3.5-4B-EOQ-Q5) [Q6](https://huggingface.co/caiovicentino1/Qwen3.5-4B-EOQ-Q6) |
 | Qwen3.5-27B EOQ Q5 (compressed) | [Q5](https://huggingface.co/caiovicentino1/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-EOQ-Q5-compressed) |
 | Qwen3.5-35B-A3B EOQ Q5 (compressed) | [Q5](https://huggingface.co/caiovicentino1/Qwen3.5-35B-A3B-EOQ-Q5-compressed) |
+| GLM-4.7-Flash EOQ Q5 (compressed) | [Q5](https://huggingface.co/caiovicentino1/GLM-4.7-Flash-Claude-Opus-4.5-High-Reasoning-Distill-EOQ-Q5-compressed) |
 
 ## Usage
 
