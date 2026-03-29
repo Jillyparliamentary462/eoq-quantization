@@ -4,15 +4,15 @@ Simple absmax quantization + rANS entropy coding that matches complex GGUF K-qua
 
 ## Key Results (RTX PRO 6000 Blackwell, 96 GB VRAM)
 
-| Model | FP16 Size | EOQ Q5 Size | PPL FP16 | PPL Q5 | Delta | tok/s |
-|-------|-----------|-------------|----------|--------|-------|-------|
-| Qwen2.5-0.5B | 988 MB | 279 MB | 10.87 | 11.69 | +0.83 | 145.0 |
-| Qwen2.5-3B | 6,172 MB | 1,724 MB | 6.54 | 6.77 | +0.23 | 97.1 |
-| Qwen3.5-4B | 8,412 MB | 2,398 MB | 7.58 | 7.77 | +0.18 | 54.1 |
-| Qwen3.5-27B | 53,792 MB | 15,353 MB | 5.65 | 5.94 | +0.31 | 6.3 |
-| **Qwen3.5-35B-A3B** | **69,321 MB** | **19,680 MB** | **5.19** | **5.39** | **+0.21** | **30.1** |
+| Model | FP16 Size | EOQ Q5 Size | EOQ Q5 Download | PPL FP16 | PPL Q5 | Delta | tok/s |
+|-------|-----------|-------------|-----------------|----------|--------|-------|-------|
+| Qwen2.5-0.5B | 988 MB | 279 MB | — | 10.87 | 11.69 | +0.83 | 145.0 |
+| Qwen2.5-3B | 6,172 MB | 1,724 MB | — | 6.54 | 6.77 | +0.23 | 97.1 |
+| Qwen3.5-4B | 8,412 MB | 2,398 MB | — | 7.58 | 7.77 | +0.18 | 54.1 |
+| Qwen3.5-27B | 53,792 MB | 15,353 MB | 27.3 GB | 5.65 | 5.64 | -0.01 | 6.2 |
+| **Qwen3.5-35B-A3B** | **69,321 MB** | **19,680 MB** | **35.2 GB** | **5.19** | **5.39** | **+0.20** | **30.2** |
 
-EOQ Q5 achieves **3.5x compression** with PPL degradation of only +0.18 to +0.83 points and **zero inference overhead** (identical tok/s to FP16).
+EOQ Q5 achieves **3.5x compression** with PPL degradation of only +0.18 to +0.83 points and **zero inference overhead** (identical tok/s to FP16). Compressed format halves download size (35.2 GB vs 69.3 GB for 35B model).
 
 ## How It Works
 
@@ -24,6 +24,7 @@ FP16 weights --> Block Absmax Quantization (Q5) --> rANS Entropy Coding --> .eoq
 1. **Absmax quantization**: simple block-wise symmetric quantization (no complex K-quant schemes)
 2. **rANS entropy coding**: removes redundancy in quantized codes (Shannon entropy < bit width)
 3. **Dequantized FP16 safetensors**: models load directly with `transformers` (no custom code needed)
+4. **Compressed HuggingFace format**: INT5 codes (1 byte) + FP16 scales stored in safetensors — 2x smaller download, dequantized at load time
 
 ## Inference Speed
 
@@ -41,6 +42,8 @@ For speed improvement with reduced RAM, we developed custom CUDA INT4 kernels:
 | Qwen2.5-0.5B EOQ Q4/Q5/Q6/Q8 | [Q4](https://huggingface.co/caiovicentino1/Qwen2.5-0.5B-EOQ-Q4) [Q5](https://huggingface.co/caiovicentino1/Qwen2.5-0.5B-EOQ-Q5) [Q6](https://huggingface.co/caiovicentino1/Qwen2.5-0.5B-EOQ-Q6) [Q8](https://huggingface.co/caiovicentino1/Qwen2.5-0.5B-EOQ-Q8) |
 | Qwen2.5-3B EOQ Q4/Q5/Q6 | [Q4](https://huggingface.co/caiovicentino1/Qwen2.5-3B-EOQ-Q4) [Q5](https://huggingface.co/caiovicentino1/Qwen2.5-3B-EOQ-Q5) [Q6](https://huggingface.co/caiovicentino1/Qwen2.5-3B-EOQ-Q6) |
 | Qwen3.5-4B EOQ Q4/Q5/Q6 | [Q4](https://huggingface.co/caiovicentino1/Qwen3.5-4B-EOQ-Q4) [Q5](https://huggingface.co/caiovicentino1/Qwen3.5-4B-EOQ-Q5) [Q6](https://huggingface.co/caiovicentino1/Qwen3.5-4B-EOQ-Q6) |
+| Qwen3.5-27B EOQ Q5 (compressed) | [Q5](https://huggingface.co/caiovicentino1/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-EOQ-Q5-compressed) |
+| Qwen3.5-35B-A3B EOQ Q5 (compressed) | [Q5](https://huggingface.co/caiovicentino1/Qwen3.5-35B-A3B-EOQ-Q5-compressed) |
 
 ## Usage
 
