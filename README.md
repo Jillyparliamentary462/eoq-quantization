@@ -70,12 +70,31 @@ AWQ pre-scaling halved the PPL delta: from +0.89 to +0.43 at identical download 
 
 ## Inference Speed
 
-EOQ models are stored as dequantized FP16 safetensors. Inference speed is **identical to FP16** (no quantized kernels). The advantage is **smaller file size** at comparable quality, not speed.
+EOQ models can be loaded with **torchao** for fast quantized inference with optimized CUDA kernels:
 
-For speed improvement with reduced RAM, we developed custom CUDA INT4 kernels:
-- RAM: 2.8x less than FP16 (2,214 MB vs 6,172 MB for Qwen2.5-3B)
-- Speed: 0.76x of FP16 (75.5 vs 98.7 tok/s) -- kernel optimization ongoing
-- See `kernels/` directory for 16 CUDA kernel variants
+### Benchmark (Qwen3.5-9B, RTX PRO 6000 Blackwell)
+
+| Method | tok/s | Speedup | VRAM | RAM Save |
+|--------|-------|---------|------|----------|
+| FP16 (baseline) | 45.7 | 1.00x | 17.9 GB | --- |
+| **torchao INT4** | **43.3** | **0.95x** | **6.3 GB** | **65%** |
+| BitsAndBytes NF4 | 34.6 | 0.76x | 7.7 GB | 57% |
+| EOQ QuantizedLinear | 6.7 | 0.15x | 8.2 GB | 54% |
+
+torchao INT4 achieves **95% of FP16 speed** with **65% less VRAM**. Combined with EOQ's 4.93 GB download, the full pipeline is:
+
+```
+Download (4.93 GB EOQ) → Dequantize → torchao INT4 → 43 tok/s, 6.3 GB VRAM
+```
+
+### Usage with torchao
+```python
+from torchao.quantization import quantize_, Int4WeightOnlyConfig
+
+model = load_eoq_model("caiovicentino1/Qwen3.5-9B-EOQ-Dynamic-BitPacked")
+quantize_(model, Int4WeightOnlyConfig(group_size=128))
+# Now runs at 43 tok/s with 6.3 GB VRAM
+```
 
 ## Published Models
 
