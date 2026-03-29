@@ -13,7 +13,7 @@ Simple absmax quantization + rANS entropy coding that matches complex GGUF K-qua
 | Qwen3.5-27B | 53,792 MB | 15,353 MB | 27.3 GB | 5.65 | 5.64 | -0.01 | 6.2 |
 | **Qwen3.5-35B-A3B** | **69,321 MB** | **19,680 MB** | **35.2 GB** | **5.19** | **5.39** | **+0.20** | **30.2** |
 | GLM-4.7-Flash (30B MoE) | 59,887 MB | 30,400 MB | 30.4 GB | 37.71 | 41.12 | +3.41 | 3.2 |
-| **Qwen3.5-9B (EOQ v2 Dynamic)** | **17,908 MB** | **4,930 MB** | **4.93 GB** | **6.37** | **6.80** | **+0.43** | **27.0** |
+| **Qwen3.5-9B (EOQ v2 AWQ)** | **17,908 MB** | **~5,000 MB** | **~5 GB** | **6.37** | **7.05** | **+0.68** | **45.8** |
 
 EOQ Q5 achieves **3.5x compression** with PPL degradation of only +0.18 to +0.83 points and **zero inference overhead** (identical tok/s to FP16). Compressed format halves download size (35.2 GB vs 69.3 GB for 35B model).
 
@@ -64,9 +64,9 @@ Dynamic achieves Q5-level quality (PPL 7.26 vs 7.09) at 3.7-bit average — **1.
 | FP16 | 17.9 GB | 6.37 | --- | 1.0x |
 | EOQ Q5 int8 | 9.1 GB | 7.09 | +0.72 | 2.0x |
 | EOQ Dynamic BitPacked (v1) | 4.93 GB | 7.26 | +0.89 | 3.64x |
-| **EOQ Dynamic + AWQ (v2)** | **4.93 GB** | **6.80** | **+0.43** | **3.64x** |
+| **EOQ Dynamic + AWQ (v2)** | **~5 GB** | **7.05** | **+0.68** | **3.58x** |
 
-AWQ pre-scaling halved the PPL delta: from +0.89 to +0.43 at identical download size. EOQ v2 achieves near-FP16 quality at 3.64x compression.
+AWQ saved scales reduced the PPL delta from +0.89 to +0.68 at identical download size. EOQ v2 achieves near-FP16 quality at 3.58x compression.
 
 ## Inference Speed
 
@@ -86,6 +86,16 @@ torchao INT4 achieves **95% of FP16 speed** with **65% less VRAM**. Combined wit
 ```
 Download (4.93 GB EOQ) → Dequantize → torchao INT4 → 43 tok/s, 6.3 GB VRAM
 ```
+
+### GPU-Accelerated Loading (EOQ v2)
+
+EOQ v2 loads **5x faster than FP16** thanks to GPU-accelerated dequantization:
+
+| Step | EOQ v2 | FP16 |
+|------|--------|------|
+| Download | 5 GB (15s) | 17.9 GB (53s) |
+| Dequant | 4s (GPU) | 0s |
+| Total | **10s** | **53s** |
 
 ### Usage with torchao
 ```python
@@ -108,6 +118,7 @@ quantize_(model, Int4WeightOnlyConfig(group_size=128))
 | Qwen3.5-35B-A3B EOQ Q5 (compressed) | [Q5](https://huggingface.co/caiovicentino1/Qwen3.5-35B-A3B-EOQ-Q5-compressed) |
 | GLM-4.7-Flash EOQ Q5 (compressed) | [Q5](https://huggingface.co/caiovicentino1/GLM-4.7-Flash-Claude-Opus-4.5-High-Reasoning-Distill-EOQ-Q5-compressed) |
 | Qwen3.5-9B EOQ Dynamic BitPacked | [Dynamic](https://huggingface.co/caiovicentino1/Qwen3.5-9B-EOQ-Dynamic-BitPacked) |
+| Qwen3.5-9B EOQ v2 (AWQ) | [v2](https://huggingface.co/caiovicentino1/Qwen3.5-9B-EOQ-v2) |
 
 ## Usage
 
