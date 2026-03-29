@@ -13,7 +13,7 @@ Simple absmax quantization + rANS entropy coding that matches complex GGUF K-qua
 | Qwen3.5-27B | 53,792 MB | 15,353 MB | 27.3 GB | 5.65 | 5.64 | -0.01 | 6.2 |
 | **Qwen3.5-35B-A3B** | **69,321 MB** | **19,680 MB** | **35.2 GB** | **5.19** | **5.39** | **+0.20** | **30.2** |
 | GLM-4.7-Flash (30B MoE) | 59,887 MB | 30,400 MB | 30.4 GB | 37.71 | 41.12 | +3.41 | 3.2 |
-| **Qwen3.5-9B (Dynamic BitPacked)** | **17,908 MB** | **4,930 MB** | **4.93 GB** | **6.37** | **7.31** | **+0.94** | **27.0** |
+| **Qwen3.5-9B (EOQ v2 Dynamic)** | **17,908 MB** | **4,930 MB** | **4.93 GB** | **6.37** | **6.80** | **+0.43** | **27.0** |
 
 EOQ Q5 achieves **3.5x compression** with PPL degradation of only +0.18 to +0.83 points and **zero inference overhead** (identical tok/s to FP16). Compressed format halves download size (35.2 GB vs 69.3 GB for 35B model).
 
@@ -57,17 +57,16 @@ This achieves ~3.5-bit average with better quality than uniform Q5, at smaller s
 
 Dynamic achieves Q5-level quality (PPL 7.26 vs 7.09) at 3.7-bit average — **1.54 PPL better than Uniform Q4** at the same storage footprint. With proper bit-packing, Dynamic would be ~24% smaller than Uniform Q5.
 
-### BitPacked Format (NEW)
+### Verified Results (Qwen3.5-9B, Blackwell/H100)
 
-EOQ Dynamic BitPacked stores codes in actual N-bit representation instead of int8, achieving real compression:
+| Format | Download | PPL | Delta | Compression |
+|--------|----------|-----|-------|-------------|
+| FP16 | 17.9 GB | 6.37 | --- | 1.0x |
+| EOQ Q5 int8 | 9.1 GB | 7.09 | +0.72 | 2.0x |
+| EOQ Dynamic BitPacked (v1) | 4.93 GB | 7.26 | +0.89 | 3.64x |
+| **EOQ Dynamic + AWQ (v2)** | **4.93 GB** | **6.80** | **+0.43** | **3.64x** |
 
-| Format | Qwen3.5-9B Download | PPL | Compression |
-|--------|-------------------|-----|-------------|
-| FP16 | 17.9 GB | 6.37 | 1.0x |
-| EOQ Q5 int8 | 9.1 GB | 7.09 | 2.0x |
-| **EOQ Dynamic BitPacked** | **4.93 GB** | **7.31** | **3.64x** |
-
-46% smaller than Q5 int8 with only +0.22 PPL difference. Combines per-tensor mixed-bit allocation with bit-level packing.
+AWQ pre-scaling halved the PPL delta: from +0.89 to +0.43 at identical download size. EOQ v2 achieves near-FP16 quality at 3.64x compression.
 
 ## Inference Speed
 
