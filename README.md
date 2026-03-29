@@ -28,6 +28,34 @@ FP16 weights --> Block Absmax Quantization (Q5) --> rANS Entropy Coding --> .eoq
 3. **Dequantized FP16 safetensors**: models load directly with `transformers` (no custom code needed)
 4. **Compressed HuggingFace format**: INT5 codes (1 byte) + FP16 scales stored in safetensors — 2x smaller download, dequantized at load time
 
+## EOQ Dynamic (Mixed-Bit)
+
+Inspired by [Unsloth Dynamic 2.0](https://unsloth.ai), EOQ Dynamic assigns different bit widths per tensor based on quantization sensitivity:
+
+| Tensor Type | Bits | Why |
+|-------------|------|-----|
+| MLP gate/up projections | 3 | Most robust to quantization |
+| MLP down projection | 4 | Slightly more sensitive |
+| Attention Q/K/V | 5 | Moderate sensitivity |
+| Attention O/output proj | 6 | High sensitivity (no AWQ fix) |
+| Embedding | 5 | Safe |
+| LM head | 6 | Nearly lossless |
+| Norms, biases, routing | FP16 | Must stay full precision |
+| SSM tensors (Mamba) | FP16 | Catastrophic if quantized |
+
+This achieves ~3.5-bit average with better quality than uniform Q5, at smaller size.
+
+### Verified Results (Qwen3.5-9B, H100 80GB)
+
+| Method | Avg Bits | PPL | Delta | tok/s |
+|--------|----------|-----|-------|-------|
+| FP16 (baseline) | 16 | 6.37 | --- | 29.4 |
+| Uniform Q4 | 4.0 | 8.80 | +2.42 | 30.2 |
+| **EOQ Dynamic** | **3.7** | **7.26** | **+0.89** | **29.7** |
+| Uniform Q5 | 5.0 | 7.09 | +0.71 | 29.9 |
+
+Dynamic achieves Q5-level quality (PPL 7.26 vs 7.09) at 3.7-bit average — **1.54 PPL better than Uniform Q4** at the same storage footprint. With proper bit-packing, Dynamic would be ~24% smaller than Uniform Q5.
+
 ## Inference Speed
 
 EOQ models are stored as dequantized FP16 safetensors. Inference speed is **identical to FP16** (no quantized kernels). The advantage is **smaller file size** at comparable quality, not speed.
