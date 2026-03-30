@@ -137,12 +137,17 @@ Dettmers et al.~\cite{dettmers2024qlora} introduced NormalFloat, a data type wit
 \subsection{QuIP and QuIP\#}
 \label{sec:quip}
 
-QuIP~\cite{tseng2024quip_original} introduced incoherence processing for weight quantization, showing that random orthogonal rotations improve quantization bounds. QuIP\#~\cite{chee2024quip} extended this with Hadamard transforms and lattice codebooks for 2-bit quantization. While PolarQuant shares the use of Hadamard transforms, our approach differs fundamentally: QuIP\# uses incoherence to bound the worst-case quantization error, while PolarQuant uses normalization and rotation to transform the \emph{distribution} to Gaussian, enabling the use of the analytically optimal Lloyd--Max quantizer.
+QuIP~\cite{tseng2024quip_original} introduced incoherence processing for weight quantization, showing that random orthogonal rotations improve quantization bounds. QuIP\#~\cite{chee2024quip} extended this with randomized Hadamard transforms (RHT) and lattice codebooks for 2-bit quantization. While PolarQuant shares the use of Hadamard transforms, our approach differs in two key ways: (1)~QuIP\# applies rotations to the \emph{entire} weight matrix columns (inter-block), while PolarQuant applies rotations \emph{within} each block of 128 elements (intra-block); and (2)~QuIP\# uses incoherence to bound worst-case error, while PolarQuant uses normalization and rotation to transform the distribution to Gaussian.
+
+\subsection{QuaRot and SpinQuant}
+\label{sec:quarot}
+
+QuaRot~\cite{ashkboos2024quarot} demonstrated that applying Hadamard rotations to hidden states, activations, and KV cache removes outliers without changing model output, enabling outlier-free 4-bit inference. SpinQuant~\cite{liu2024spinquant} further showed that \emph{learned} rotation matrices outperform fixed Hadamard rotations by up to 16 points on zero-shot tasks. Both methods apply rotations \emph{between layers} (requiring graph surgery to absorb rotations into adjacent linear layers), while PolarQuant applies rotations \emph{within blocks} of each weight tensor independently, requiring no modification to the model graph and enabling use as a simple preprocessing step.
 
 \subsection{TurboQuant}
 \label{sec:turboquant}
 
-TurboQuant~\cite{ashkboos2025turboquant} applies the polar quantization framework to KV cache compression during inference. It normalizes KV vectors, applies Hadamard rotation, and quantizes the resulting Gaussian coordinates with optimal centroids. Our work adapts this approach from KV cache to weight compression, demonstrates its effectiveness as a preprocessing step for downstream INT4 quantizers, and introduces the combination with AWQ for near-lossless weight compression.
+TurboQuant~\cite{ashkboos2025turboquant} applies the polar quantization framework to KV cache compression during inference, normalizing KV vectors, applying random rotation, and quantizing the resulting near-Gaussian coordinates with optimal centroids. TurboQuant proves information-theoretic lower bounds and achieves near-optimal distortion rates. Our work adapts this approach from KV cache to \emph{weight} compression, demonstrates its effectiveness as a preprocessing step for downstream INT4 quantizers, and provides the first ablation quantifying the individual contributions of rotation (98\%) versus optimal centroids (2\%) at Q5.
 
 \subsection{Lloyd--Max Quantization}
 \label{sec:lloydmax_bg}
